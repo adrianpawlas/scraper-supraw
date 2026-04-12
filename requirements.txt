@@ -6,3 +6,4 @@ transformers
 supabase
 python-dotenv
 sentencepiece
+protobuf
