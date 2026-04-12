@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+pillow
+torch
+transformers
+supabase
+python-dotenv
