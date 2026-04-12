@@ -1,7 +1,7 @@
 from supabase import create_client, Client
 from typing import Dict, List, Optional
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import SUPABASE_URL, SUPABASE_KEY, SCRAPER_SOURCE, BRAND
 
 
@@ -10,6 +10,7 @@ class SupabaseManager:
         self.client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         self.source = SCRAPER_SOURCE
         self.brand = BRAND
+        self.batch_size = 50
     
     def check_existing_product(self, product_url: str) -> Optional[Dict]:
         """Check if product already exists in database"""
@@ -19,13 +20,124 @@ class SupabaseManager:
             return response.data[0]
         return None
     
+    def check_existing_products_batch(self, product_urls: List[str]) -> Dict[str, Dict]:
+        """Check multiple products at once - returns dict of url -> existing data"""
+        if not product_urls:
+            return {}
+        
+        response = self.client.table('products').select('*').eq('source', self.source).in_('product_url', product_urls).execute()
+        
+        result = {}
+        for item in response.data:
+            result[item['product_url']] = item
+        return result
+    
+    def get_all_product_urls(self) -> List[str]:
+        """Get all product URLs for this source - used for stale detection"""
+        response = self.client.table('products').select('product_url').eq('source', self.source).execute()
+        return [item['product_url'] for item in response.data]
+    
+    def get_stale_product_urls(self, seen_urls: List[str], consecutive_runs: int = 2) -> List[str]:
+        """Get products marked as stale (not seen in X consecutive runs)
+        Note: Uses metadata JSON to track stale_count since column may not exist"""
+        seen_set = set(seen_urls)
+        
+        response = self.client.table('products').select('product_url, metadata').eq('source', self.source).execute()
+        
+        stale_urls = []
+        for item in response.data:
+            product_url = item['product_url']
+            metadata = item.get('metadata')
+            
+            stale_count = 0
+            if metadata:
+                try:
+                    meta = json.loads(metadata) if isinstance(metadata, str) else metadata
+                    stale_count = meta.get('stale_count', 0)
+                except:
+                    pass
+            
+            if product_url not in seen_set:
+                new_count = stale_count + 1
+                if new_count >= consecutive_runs:
+                    stale_urls.append(product_url)
+            
+            new_metadata = meta if metadata else {}
+            if not isinstance(new_metadata, dict):
+                new_metadata = {}
+            new_metadata['stale_count'] = stale_count + 1 if product_url not in seen_set else 0
+            
+            try:
+                self.client.table('products').update({'metadata': json.dumps(new_metadata)}).eq('source', self.source).eq('product_url', product_url).execute()
+            except:
+                pass
+        
+        return stale_urls
+    
+    def mark_products_seen(self, product_urls: List[str]) -> None:
+        """Reset stale_count for products seen in this run - uses metadata"""
+        if not product_urls:
+            return
+        
+        for url in product_urls:
+            try:
+                response = self.client.table('products').select('metadata').eq('source', self.source).eq('product_url', url).execute()
+                if response.data:
+                    metadata = response.data[0].get('metadata')
+                    meta = {}
+                    if metadata:
+                        try:
+                            meta = json.loads(metadata) if isinstance(metadata, str) else metadata
+                        except:
+                            pass
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta['stale_count'] = 0
+                    meta['last_seen'] = datetime.utcnow().isoformat()
+                    self.client.table('products').update({'metadata': json.dumps(meta)}).eq('source', self.source).eq('product_url', url).execute()
+            except:
+                pass
+    
+    def increment_stale_count(self, product_urls: List[str]) -> None:
+        """Increment stale_count for products not seen in this run - uses metadata"""
+        if not product_urls:
+            return
+        
+        seen_set = set(product_urls)
+        
+        try:
+            response = self.client.table('products').select('product_url, metadata').eq('source', self.source).execute()
+            
+            for item in response.data:
+                product_url = item['product_url']
+                
+                if product_url not in seen_set:
+                    metadata = item.get('metadata')
+                    meta = {}
+                    if metadata:
+                        try:
+                            meta = json.loads(metadata) if isinstance(metadata, str) else metadata
+                        except:
+                            pass
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    
+                    current_count = meta.get('stale_count', 0)
+                    meta['stale_count'] = current_count + 1
+                    
+                    try:
+                        self.client.table('products').update({'metadata': json.dumps(meta)}).eq('source', self.source).eq('product_url', product_url).execute()
+                    except:
+                        pass
+        except:
+            pass
+    
     def parse_price(self, price_text: str) -> str:
         """Convert price to format 'amountCURRENCY'"""
         if not price_text:
             return ""
         
         import re
-        
         price_text = price_text.strip()
         
         patterns = [
@@ -36,7 +148,6 @@ class SupabaseManager:
             (r'([\d.,]+)\s*kr\.', 'SEK'),
             (r'([\d.,]+)\s*CHF', 'CHF'),
             (r'([\d.,]+)\s*PLN', 'PLN'),
-            (r'([\d.,]+)\s*Kč', 'CZK'),
         ]
         
         prices = []
@@ -64,7 +175,6 @@ class SupabaseManager:
             return ""
         
         category = category.strip()
-        
         separators = ['&', ' and ', '/']
         parts = [category]
         
@@ -74,15 +184,28 @@ class SupabaseManager:
                 new_parts.extend(part.split(sep))
             parts = new_parts
         
-        categories = []
-        for part in parts:
-            part = part.strip()
-            if part:
-                categories.append(part)
-        
+        categories = [part.strip() for part in parts if part.strip()]
         return ', '.join(categories)
     
-    def prepare_product_data(self, product_details: Dict) -> Dict:
+    def compare_products(self, scraped: Dict, existing: Dict) -> bool:
+        """Compare scraped data against existing - return True if changed"""
+        fields_to_check = ['title', 'price', 'sale', 'description', 'size']
+        
+        for field in fields_to_check:
+            scraped_val = scraped.get(field)
+            existing_val = existing.get(field)
+            
+            if scraped_val != existing_val:
+                return True
+        
+        scraped_img = scraped.get('image_url', '')
+        existing_img = existing.get('image_url', '')
+        if scraped_img != existing_img:
+            return True
+        
+        return False
+    
+    def prepare_product_data(self, product_details: Dict, regenerate_embeddings: bool = False) -> Dict:
         """Prepare product data for database insertion"""
         product_id = product_details.get('id', product_details.get('product_url', '').split('/products/')[-1])
         
@@ -106,12 +229,11 @@ class SupabaseManager:
             'sale': sale_raw,
             'category': product_details.get('category'),
             'gender': product_details.get('gender'),
+            'stale_count': 0,
+            'last_seen': datetime.utcnow().isoformat(),
         }
         
         category = self.parse_category(product_details.get('category', ''))
-        
-        image_embedding = product_details.get('image_embedding')
-        info_embedding = product_details.get('info_embedding')
         
         data = {
             'id': product_id,
@@ -134,64 +256,114 @@ class SupabaseManager:
             'created_at': datetime.utcnow().isoformat(),
         }
         
-        if image_embedding:
-            if isinstance(image_embedding, list):
-                data['image_embedding'] = json.dumps(image_embedding)
+        if regenerate_embeddings and product_details.get('image_embedding'):
+            if isinstance(product_details['image_embedding'], list):
+                data['image_embedding'] = json.dumps(product_details['image_embedding'])
             else:
-                data['image_embedding'] = image_embedding
+                data['image_embedding'] = product_details['image_embedding']
         
-        if info_embedding:
-            if isinstance(info_embedding, list):
-                data['info_embedding'] = json.dumps(info_embedding)
+        if regenerate_embeddings and product_details.get('info_embedding'):
+            if isinstance(product_details['info_embedding'], list):
+                data['info_embedding'] = json.dumps(product_details['info_embedding'])
             else:
-                data['info_embedding'] = info_embedding
+                data['info_embedding'] = product_details['info_embedding']
         
         return data
     
-    def insert_product(self, product_data: Dict) -> bool:
-        """Insert a single product into the database"""
-        try:
-            response = self.client.table('products').insert(product_data).execute()
-            return True
-        except Exception as e:
-            error_str = str(e)
-            if 'duplicate key' in error_str.lower() or 'unique constraint' in error_str.lower():
-                print(f"Product already exists: {product_data.get('title')}")
+    def batch_insert(self, products: List[Dict], max_retries: int = 3) -> tuple:
+        """Insert/update products in batches with retry logic"""
+        if not products:
+            return 0, []
+        
+        failed = []
+        
+        for i in range(0, len(products), self.batch_size):
+            batch = products[i:i + self.batch_size]
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = self.client.table('products').upsert(batch, on_conflict='source, product_url').execute()
+                    
+                    if response.data:
+                        break
+                    retry_count += 1
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        failed.extend([p.get('product_url', 'unknown') for p in batch])
+                        self.log_failed_products(batch, str(e))
+                    else:
+                        time.sleep(1)
+        
+        return len(products) - len(failed), failed
+    
+    def log_failed_products(self, products: List[Dict], error: str) -> None:
+        """Log failed products to file"""
+        import os
+        from datetime import datetime
+        
+        log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_file = os.path.join(log_dir, 'failed_products.log')
+        
+        timestamp = datetime.now().isoformat()
+        with open(log_file, 'a') as f:
+            f.write(f"\n--- Failed at {timestamp} ---\n")
+            f.write(f"Error: {error}\n")
+            for p in products:
+                f.write(f"Product: {p.get('product_url', 'unknown')}\n")
+    
+    def delete_products(self, product_urls: List[str]) -> int:
+        """Delete products by URLs"""
+        if not product_urls:
+            return 0
+        
+        deleted = 0
+        for url in product_urls:
+            try:
+                self.client.table('products').delete().eq('source', self.source).eq('product_url', url).execute()
+                deleted += 1
+            except Exception as e:
+                print(f"Failed to delete {url}: {e}")
+        
+        return deleted
+    
+    def process_products_batch(self, products_with_details: List[Dict], existing_products: Dict[str, Dict]) -> tuple:
+        """Process products and determine what to insert/update/skip"""
+        new_products = []
+        products_to_update = []
+        unchanged_products = []
+        
+        for product in products_with_details:
+            product_url = product.get('product_url')
+            existing = existing_products.get(product_url)
+            
+            needs_embedding = False
+            should_skip = False
+            
+            if existing is None:
+                needs_embedding = True
+                new_products.append(product)
             else:
-                print(f"Error inserting product {product_data.get('title')}: {e}")
-            return False
-    
-    def update_product(self, product_url: str, product_data: Dict) -> bool:
-        """Update an existing product"""
-        try:
-            response = self.client.table('products').update(product_data).eq('source', self.source).eq('product_url', product_url).execute()
-            return True
-        except Exception as e:
-            print(f"Error updating product: {e}")
-            return False
-    
-    def upsert_product(self, product_details: Dict) -> bool:
-        """Insert or update a product"""
-        existing = self.check_existing_product(product_details.get('product_url', ''))
+                image_changed = product.get('image_url') != existing.get('image_url')
+                
+                if image_changed:
+                    needs_embedding = True
+                
+                has_changes = self.compare_products(product, existing)
+                
+                if has_changes:
+                    products_to_update.append(product)
+                else:
+                    unchanged_products.append(product)
+                    should_skip = True
+            
+            product['needs_embedding'] = needs_embedding
+            product['should_skip'] = should_skip
         
-        product_data = self.prepare_product_data(product_details)
-        
-        if existing:
-            print(f"Product already exists, updating: {product_data.get('title')}")
-            return self.update_product(product_details.get('product_url', ''), product_data)
-        else:
-            print(f"Inserting new product: {product_data.get('title')}")
-            return self.insert_product(product_data)
-    
-    def batch_insert(self, products: List[Dict]) -> int:
-        """Insert multiple products"""
-        success_count = 0
-        
-        for product in products:
-            if self.upsert_product(product):
-                success_count += 1
-        
-        return success_count
+        return new_products, products_to_update, unchanged_products
 
 
 def main():
@@ -214,7 +386,7 @@ def main():
     data = manager.prepare_product_data(test_product)
     print("Prepared product data:")
     for key, value in data.items():
-        if key != 'metadata':
+        if key not in ['metadata']:
             print(f"  {key}: {value}")
 
 
