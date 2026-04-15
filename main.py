@@ -69,7 +69,9 @@ class SuprawScraper:
             needs_compression = True
             has_changes = True
         else:
-            image_changed = details.get('image_url') != existing.get('image_url')
+            existing_url = self.supabase_manager.normalize_image_url(existing.get('image_url', ''))
+            scraped_url = self.supabase_manager.normalize_image_url(details.get('image_url', ''))
+            image_changed = scraped_url != existing_url
             if image_changed:
                 needs_embedding = True
                 needs_compression = True

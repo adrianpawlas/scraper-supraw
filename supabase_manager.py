@@ -188,9 +188,27 @@ class SupabaseManager:
         categories = [part.strip() for part in parts if part.strip()]
         return ', '.join(categories)
     
+    def normalize_image_url(self, url: str) -> str:
+        """Normalize image URL for comparison - remove width params and normalize domain/path"""
+        if not url:
+            return ""
+        
+        url = url.split('?')[0]
+        
+        url = url.replace('https://cdn.shopify.com/s/files/', 'https://supraw.com/cdn/shop/files/')
+        url = url.replace('https://cdn.shopify.com/files/', 'https://supraw.com/cdn/shop/files/')
+        
+        import re
+        match = re.search(r'files/([^/]+)$', url)
+        if match:
+            filename = match.group(1)
+            return f"https://supraw.com/cdn/shop/files/{filename}"
+        
+        return url
+    
     def compare_products(self, scraped: Dict, existing: Dict) -> bool:
         """Compare scraped data against existing - return True if changed"""
-        fields_to_check = ['title', 'price', 'sale', 'description', 'size']
+        fields_to_check = ['title', 'price', 'sale', 'description']
         
         for field in fields_to_check:
             scraped_val = scraped.get(field)
@@ -199,8 +217,15 @@ class SupabaseManager:
             if scraped_val != existing_val:
                 return True
         
-        scraped_img = scraped.get('image_url', '')
-        existing_img = existing.get('image_url', '')
+        scraped_sizes = ', '.join(scraped.get('sizes', [])) if scraped.get('sizes') else None
+        existing_size = existing.get('size')
+        
+        if scraped_sizes != existing_size:
+            return True
+        
+        scraped_img = self.normalize_image_url(scraped.get('image_url', ''))
+        existing_img = self.normalize_image_url(existing.get('image_url', ''))
+        
         if scraped_img != existing_img:
             return True
         
