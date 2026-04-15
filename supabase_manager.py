@@ -1,6 +1,7 @@
 from supabase import create_client, Client
 from typing import Dict, List, Optional
 import json
+import time
 from datetime import datetime, timedelta
 from config import SUPABASE_URL, SUPABASE_KEY, SCRAPER_SOURCE, BRAND
 
