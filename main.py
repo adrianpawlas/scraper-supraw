@@ -153,7 +153,7 @@ class SuprawScraper:
             try:
                 result = self.process_product(product, existing_products)
                 
-                if result:
+                if isinstance(result, dict):
                     batch_data.append(result)
             except Exception as e:
                 print(f"  Error processing product: {e}")
