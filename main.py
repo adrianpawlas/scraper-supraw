@@ -6,7 +6,6 @@ from config import CATEGORY_URLS
 from scraper import extract_products_from_collection, extract_product_details, parse_category_from_url
 from embeddings import EmbeddingGenerator
 from supabase_manager import SupabaseManager
-from image_compressor import compress_image, get_compressed_url
 
 
 class SuprawScraper:
@@ -18,7 +17,6 @@ class SuprawScraper:
             'updated': 0,
             'unchanged': 0,
             'deleted': 0,
-            'compressed': 0,
         }
     
     def scrape_all_collections(self) -> List[Dict]:
@@ -47,7 +45,7 @@ class SuprawScraper:
         return all_products
     
     def process_product(self, product_info: Dict, existing_products: Dict[str, Dict]) -> bool:
-        """Process a single product: get details, generate embeddings, compress image, prepare for batch"""
+        """Process a single product: get details, generate embeddings, prepare for batch"""
         product_url = product_info.get('product_url')
         category = product_info.get('category')
         
@@ -56,17 +54,15 @@ class SuprawScraper:
         details = extract_product_details(product_url)
         
         if not details or not details.get('image_url'):
-            return False
+            return None
         
         details['category'] = category
         
         needs_embedding = False
         has_changes = False
-        needs_compression = False
         
         if existing is None:
             needs_embedding = True
-            needs_compression = True
             has_changes = True
         else:
             existing_url = self.supabase_manager.normalize_image_url(existing.get('image_url', ''))
@@ -74,33 +70,12 @@ class SuprawScraper:
             image_changed = scraped_url != existing_url
             if image_changed:
                 needs_embedding = True
-                needs_compression = True
             
             has_changes = self.supabase_manager.compare_products(details, existing)
         
         if existing and not has_changes:
             self.stats['unchanged'] += 1
-            return True
-        
-        if needs_compression and existing is not None:
-            existing_compressed = existing.get('compressed_image_url')
-            if existing_compressed:
-                details['compressed_image_url'] = existing_compressed
-                print(f"  Using existing compressed image")
-            else:
-                print(f"  Compressing image...")
-                time.sleep(0.5)
-                compressed_url = get_compressed_url(details.get('image_url', ''), quality=90)
-                details['compressed_image_url'] = compressed_url
-                self.stats['compressed'] += 1
-                print(f"  Compressed image URL: {compressed_url[:50]}...")
-        elif needs_compression:
-            print(f"  Compressing image...")
-            time.sleep(0.5)
-            compressed_url = get_compressed_url(details.get('image_url', ''), quality=90)
-            details['compressed_image_url'] = compressed_url
-            self.stats['compressed'] += 1
-            print(f"  Compressed image URL: {compressed_url[:50]}...")
+            return None
         
         if needs_embedding and existing is not None:
             print(f"  Regenerating embeddings for changed product: {details.get('title')}")
@@ -185,7 +160,6 @@ class SuprawScraper:
         print(f"New products added: {self.stats['new']}")
         print(f"Products updated: {self.stats['updated']}")
         print(f"Products unchanged (skipped): {self.stats['unchanged']}")
-        print(f"Images compressed: {self.stats['compressed']}")
         print(f"Stale products deleted: {self.stats['deleted']}")
         print(f"End time: {datetime.now().isoformat()}")
 

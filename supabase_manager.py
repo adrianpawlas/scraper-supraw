@@ -261,8 +261,6 @@ class SupabaseManager:
         
         category = self.parse_category(product_details.get('category', ''))
         
-        compressed_url = product_details.get('compressed_image_url')
-        
         data = {
             'id': product_id,
             'source': self.source,
@@ -281,7 +279,6 @@ class SupabaseManager:
             'price': price,
             'sale': sale,
             'additional_images': additional_images_str,
-            'compressed_image_url': compressed_url if compressed_url else None,
             'created_at': datetime.utcnow().isoformat(),
         }
         
